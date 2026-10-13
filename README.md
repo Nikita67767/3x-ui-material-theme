@@ -9,5 +9,5 @@
 Выполните команду на сервере с правами root:
 
 ```bash
-bash <(curl -sSL (https://raw.githubusercontent.com/Nikita67767/3x-ui-material-theme/main/install.sh))
+bash <(curl -sSL (https://raw.githubusercontent.com/Nikita67767/3x-ui-material-theme/main/install.sh)
 ```
