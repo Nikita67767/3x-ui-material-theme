@@ -1,92 +1,189 @@
 #!/usr/bin/env bash
+set -Eeuo pipefail
 
-set -e
-
-# Настройки под твой репозиторий
 GITHUB_USER="Nikita67767"
 REPO_NAME="3x-ui-material-theme"
 BRANCH="main"
 
-RAW_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${REPO_NAME}/${BRANCH}/index.html"
 THEME_DIR="/etc/3x-ui/sub_templates/my-theme"
-INDEX_FILE="${THEME_DIR}/index.html"
+INDEX_FILE="$THEME_DIR/index.html"
+RAW_URL="https://raw.githubusercontent.com/$GITHUB_USER/$REPO_NAME/$BRANCH/index.html"
 
 GREEN='\033[0;32m'
+RED='\033[0;31m'
 CYAN='\033[0;36m'
 YELLOW='\033[1;33m'
-RED='\033[0;31m'
 NC='\033[0m'
 
-echo -e "${CYAN}==================================================${NC}"
-echo -e "${CYAN}   Установка Material You темы для 3x-ui          ${NC}"
-echo -e "${CYAN}==================================================${NC}"
+info() { echo -e "${CYAN}[INFO]${NC} $*"; }
+ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}[!] Запустите скрипт с правами root: sudo bash <(...) ${NC}"
-  exit 1
+[[ $EUID -eq 0 ]] || die "Запусти от root."
+command -v curl >/dev/null || die "Не найден curl."
+command -v python3 >/dev/null || die "Не найден python3."
+
+TMP="$(mktemp)"
+STOPPED=0
+
+cleanup() {
+    rm -f "$TMP"
+    if [[ "$STOPPED" == 1 ]]; then
+        systemctl start x-ui || true
+    fi
+}
+trap cleanup EXIT
+
+echo "=========================================="
+echo " Material You Theme — 3x-ui 3.8.5"
+echo "=========================================="
+
+info "Скачиваем шаблон..."
+curl -fsSL --connect-timeout 15 --max-time 120 \
+    "$RAW_URL" -o "$TMP" ||
+    die "Не удалось скачать шаблон."
+
+[[ -s "$TMP" ]] || die "Скачанный файл пустой."
+
+grep -qiE '<!doctype[[:space:]]+html|<html([[:space:]>])' "$TMP" ||
+    die "Скачанный файл не похож на HTML."
+
+install -d -m 755 "$THEME_DIR"
+
+if [[ -f "$INDEX_FILE" ]]; then
+    cp -p "$INDEX_FILE" "$INDEX_FILE.bak"
+    info "Создана резервная копия шаблона."
 fi
 
-echo -e "\n${YELLOW}[1/4]${NC} Создаём директорию темы..."
-mkdir -p "$THEME_DIR"
+install -m 644 "$TMP" "$INDEX_FILE"
+ok "Шаблон установлен: $INDEX_FILE"
 
-echo -e "${YELLOW}[2/4]${NC} Скачиваем шаблон с GitHub..."
-if ! curl -sSLf "$RAW_URL" -o "$INDEX_FILE"; then
-  echo -e "${RED}[!] Не удалось скачать шаблон. Проверьте подключение или наличие файла в ветке main.${NC}"
-  exit 1
-fi
-chmod 644 "$INDEX_FILE"
+info "Ищем базу данных..."
 
-echo -e "${YELLOW}[3/4]${NC} Поиск базы данных 3x-ui..."
 DB_FILE=""
-for p in "/etc/x-ui/x-ui.db" "/usr/local/x-ui/db/x-ui.db" "/usr/local/x-ui/x-ui.db"; do
-  if [ -f "$p" ]; then
-    DB_FILE="$p"
-    break
-  fi
+for p in \
+    /etc/x-ui/x-ui.db \
+    /usr/local/x-ui/db/x-ui.db \
+    /usr/local/x-ui/x-ui.db \
+    /etc/3x-ui/x-ui.db
+do
+    if [[ -f "$p" ]]; then
+        DB_FILE="$p"
+        break
+    fi
 done
 
-if [ -z "$DB_FILE" ]; then
-  DB_FILE=$(find /etc /usr/local -name "x-ui.db" 2>/dev/null | head -n 1 || true)
+if [[ -z "$DB_FILE" ]]; then
+    DB_FILE="$(find /etc /usr/local -type f -name x-ui.db \
+        -print -quit 2>/dev/null || true)"
 fi
 
-echo -e "${YELLOW}[4/4]${NC} Активация темы в настройках..."
-if [ -n "$DB_FILE" ] && command -v python3 &>/dev/null; then
-  systemctl stop x-ui 2>/dev/null || true
+[[ -n "$DB_FILE" && -f "$DB_FILE" ]] ||
+    die "База x-ui.db не найдена. Файл темы установлен, но не активирован."
 
-  python3 - << PYEOF
+info "База: $DB_FILE"
+
+systemctl is-active --quiet x-ui ||
+    warn "Служба x-ui уже остановлена или не запущена."
+
+# Останавливаем панель перед изменением SQLite.
+if systemctl is-active --quiet x-ui; then
+    systemctl stop x-ui
+    STOPPED=1
+fi
+
+# Резервная копия базы.
+DB_BACKUP="${DB_FILE}.backup-$(date +%Y%m%d-%H%M%S)"
+cp -a "$DB_FILE" "$DB_BACKUP"
+ok "Резервная копия базы: $DB_BACKUP"
+
+info "Активируем каталог темы в настройках..."
+
+if ! DB_FILE="$DB_FILE" THEME_DIR="$THEME_DIR" python3 <<'PY'
+import os
 import sqlite3
+import sys
 
-db_path = "$DB_FILE"
-target_val = "$THEME_DIR/"
+db_path = os.environ["DB_FILE"]
+theme_dir = os.environ["THEME_DIR"].rstrip("/") + "/"
 
-conn = sqlite3.connect(db_path)
-cur = conn.cursor()
+conn = sqlite3.connect(db_path, timeout=15)
 
-cur.execute("SELECT key FROM settings WHERE key='subThemePath'")
-if cur.fetchone():
-    cur.execute("UPDATE settings SET value=? WHERE key='subThemePath'", (target_val,))
-else:
-    cur.execute("INSERT INTO settings (key, value) VALUES ('subThemePath', ?)", (target_val,))
+try:
+    cur = conn.cursor()
 
-conn.commit()
-conn.close()
-PYEOF
+    tables = {
+        row[0] for row in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
 
-  systemctl start x-ui 2>/dev/null || true
-  APPLIED_AUTO=true
-else
-  systemctl restart x-ui 2>/dev/null || true
-  APPLIED_AUTO=false
+    if "settings" not in tables:
+        raise RuntimeError("В базе не найдена таблица settings")
+
+    columns = {
+        row[1] for row in cur.execute("PRAGMA table_info(settings)")
+    }
+
+    if not {"key", "value"}.issubset(columns):
+        raise RuntimeError(
+            "Неизвестная структура таблицы settings; база не изменена"
+        )
+
+    row = cur.execute(
+        "SELECT value FROM settings WHERE key = ?",
+        ("subThemeDir",)
+    ).fetchone()
+
+    if row is None:
+        raise RuntimeError(
+            "Ключ subThemeDir отсутствует. "
+            "Автоматическая запись отменена для безопасности."
+        )
+
+    cur.execute(
+        "UPDATE settings SET value = ? WHERE key = ?",
+        (theme_dir, "subThemeDir")
+    )
+
+    conn.commit()
+
+    saved = cur.execute(
+        "SELECT value FROM settings WHERE key = ?",
+        ("subThemeDir",)
+    ).fetchone()
+
+    if not saved or saved[0].rstrip("/") != theme_dir.rstrip("/"):
+        raise RuntimeError("Не удалось проверить сохранённое значение")
+
+    print("Настройка subThemeDir =", saved[0])
+
+except Exception:
+    conn.rollback()
+    raise
+finally:
+    conn.close()
+PY
+then
+    die "Не удалось автоматически активировать тему. Резервная копия сохранена."
 fi
 
-echo -e "\n${GREEN}✔ Установка завершена успешно!${NC}"
-echo -e "${CYAN}--------------------------------------------------${NC}"
-if [ "$APPLIED_AUTO" = true ]; then
-  echo -e "${GREEN}Тема активирована в панели 3x-ui автоматически!${NC}"
-  echo -e "Открывайте ссылку подписки клиента в браузере."
+info "Запускаем панель..."
+systemctl start x-ui
+STOPPED=0
+
+sleep 2
+
+if systemctl is-active --quiet x-ui; then
+    ok "Служба x-ui запущена."
 else
-  echo -e "Файл скачан. Для ручной активации в веб-панели:"
-  echo -e "Настройки панели → Подписка → Профиль"
-  echo -e "В поле «Каталог темы подписки» укажите: ${YELLOW}$THEME_DIR/${NC}"
+    warn "Проверь состояние службы: systemctl status x-ui"
+    exit 1
 fi
-echo -e "${CYAN}--------------------------------------------------${NC}"
+
+echo
+ok "Установка завершена."
+echo "Каталог темы: $THEME_DIR/"
+echo "Настройка БД: subThemeDir"
+echo "Проверь страницу подписки в браузере."
